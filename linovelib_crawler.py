@@ -11,7 +11,7 @@ linovelib_crawler.py
 6. 同时保存 TXT / MD / JSON，方便检查
 
 保存路径：
-D:\PythonProjict\pythonProject1\浩鑫\downloads\小说名\epubs\01_卷名.epub
+downloads\小说名\epubs\01_卷名.epub
 
 注意：
 只爬取公开可访问且你有权保存的内容。
