@@ -46,7 +46,7 @@ except ImportError:
 # 用户配置区：主要改这里
 # =========================================================
 
-ROOT_DIR = Path(r"D:\PythonProjict\pythonProject1\浩鑫")
+ROOT_DIR = Path(__file__).resolve().parent
 SAVE_DIR = ROOT_DIR / "downloads"
 
 BASE_URL = "https://www.linovelib.com"
@@ -193,6 +193,15 @@ def clean_spaces(text: str) -> str:
     return text
 
 
+def normalize_search_text(text: str) -> str:
+    """归一化小说名搜索文本，降低空格和标点差异的影响。"""
+    text = html.unescape(text or "")
+    text = clean_spaces(text)
+    text = text.casefold()
+    text = re.sub(r"[《》「」『』【】\[\]（）()〈〉<>·・,，.。:：;；!！?？~～\s]+", "", text)
+    return text
+
+
 def text_to_html_paragraph(text: str) -> str:
     """将一段纯文本转成 EPUB 段落"""
     text = text.strip()
@@ -257,7 +266,11 @@ class LinovelibVolumeEpubCrawler:
 
     def sleep(self):
         """请求间隔，避免请求过快"""
-        time.sleep(self.delay + random.uniform(0.5, 1.5))
+        if self.delay <= 0:
+            return
+
+        jitter = min(0.5, self.delay * 0.25)
+        time.sleep(self.delay + random.uniform(0, jitter))
 
     def get_html(self, url: str) -> str:
         """获取网页 HTML"""
@@ -319,14 +332,79 @@ class LinovelibVolumeEpubCrawler:
 
     def search_book_by_name(self, keyword: str) -> str:
         """
-        从文库列表按小说名搜索。
-        不推荐使用，容易触发 403。
+        按小说名称搜索。
+        优先扫描首页推荐区，再扫描文库页；精确匹配优先，找不到再使用包含匹配。
         """
         print(f"正在搜索小说：{keyword}")
-        print(f"将扫描文库前 {self.scan_pages} 页。")
+        print("会先扫描首页，再扫描文库页。")
 
         matches = []
         seen = set()
+        keyword_norm = normalize_search_text(keyword)
+
+        if not keyword_norm:
+            raise RuntimeError("小说名称不能为空。")
+
+        def add_matches_from_soup(soup: BeautifulSoup, source_name: str):
+            exact_added = []
+
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                title = clean_spaces(a.get_text(" ", strip=True))
+
+                if not title:
+                    continue
+
+                if not re.search(r"/novel/\d+\.html$", href):
+                    continue
+
+                full_url = urljoin(BASE_URL, href)
+
+                if full_url in seen:
+                    continue
+
+                title_norm = normalize_search_text(title)
+
+                if not title_norm:
+                    continue
+
+                if title_norm == keyword_norm:
+                    score = 100
+                elif keyword_norm in title_norm:
+                    score = 80
+                elif title_norm in keyword_norm:
+                    score = 70
+                else:
+                    continue
+
+                seen.add(full_url)
+                item = {
+                    "title": title,
+                    "url": full_url,
+                    "score": score,
+                    "source": source_name,
+                }
+                matches.append(item)
+
+                if score == 100:
+                    exact_added.append(item)
+
+            return exact_added
+
+        print(f"扫描首页：{BASE_URL}/")
+
+        try:
+            home_soup = self.get_soup(BASE_URL + "/")
+            exact_matches = add_matches_from_soup(home_soup, "首页")
+            if exact_matches:
+                chosen = exact_matches[0]
+                print(f"首页找到精确匹配：{chosen['title']}")
+                print(f"详情页：{chosen['url']}")
+                return chosen["url"]
+        except Exception as e:
+            print(f"首页读取失败：{e}")
+
+        print(f"将扫描文库前 {self.scan_pages} 页。")
 
         for page in range(1, self.scan_pages + 1):
             if page == 1:
@@ -342,50 +420,28 @@ class LinovelibVolumeEpubCrawler:
                 print(f"第 {page} 页读取失败：{e}")
                 continue
 
-            for a in soup.find_all("a", href=True):
-                href = a.get("href", "")
-                title = a.get_text(" ", strip=True)
-
-                if not title:
-                    continue
-
-                if not re.search(r"/novel/\d+\.html$", href):
-                    continue
-
-                full_url = urljoin(BASE_URL, href)
-
-                if full_url in seen:
-                    continue
-
-                seen.add(full_url)
-
-                if keyword.lower() in title.lower():
-                    matches.append(
-                        {
-                            "title": title,
-                            "url": full_url,
-                        }
-                    )
+            exact_matches = add_matches_from_soup(soup, f"文库第 {page} 页")
+            if exact_matches:
+                chosen = exact_matches[0]
+                print(f"文库第 {page} 页找到精确匹配：{chosen['title']}")
+                print(f"详情页：{chosen['url']}")
+                return chosen["url"]
 
         if not matches:
             raise RuntimeError(
                 f"\n没有找到小说：{keyword}\n\n"
                 f"建议：\n"
-                f"1. 直接在 NOVEL_KEYWORD 填小说详情页链接。\n"
-                f"2. 或者直接填小说 ID。\n"
-                f"3. 不建议把 DEFAULT_SCAN_PAGES 调太大，容易 403。\n"
+                f"1. 优先填写小说 ID。\n"
+                f"2. 也可以填写小说详情页链接。\n"
+                f"3. 可以适当调大搜索页数，但太大容易 403。\n"
             )
 
-        exact_matches = [m for m in matches if m["title"] == keyword]
-
-        if exact_matches:
-            chosen = exact_matches[0]
-        else:
-            chosen = matches[0]
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        chosen = matches[0]
 
         print("\n找到以下匹配结果：")
         for index, item in enumerate(matches[:10], 1):
-            print(f"{index}. {item['title']}")
+            print(f"{index}. {item['title']}（{item['source']}，匹配度 {item['score']}）")
             print(f"   {item['url']}")
 
         print(f"\n默认选择：{chosen['title']}")
@@ -743,6 +799,27 @@ class LinovelibVolumeEpubCrawler:
         text = clean_spaces(text)
 
         if not text:
+            return True
+
+        normalized_html_text = (
+            html.unescape(text)
+            .replace("“", "\"")
+            .replace("”", "\"")
+            .replace("‘", "'")
+            .replace("’", "'")
+            .strip()
+            .lower()
+        )
+
+        # 有些页面会把广告/占位节点以文本形式塞进正文，例如：
+        # <div class="dag"></div>。这类内容不是小说正文，生成 EPUB 前过滤掉。
+        if re.fullmatch(r"(?:<[^>]+>\s*)+", normalized_html_text):
+            return True
+
+        if re.search(
+            r"<\s*div\b[^>]*(?:class|id)\s*=\s*['\"]?dag['\"]?[^>]*>",
+            normalized_html_text,
+        ):
             return True
 
         remove_exact = {

@@ -5,6 +5,8 @@
 ## 项目内容
 
 - `linovelib_crawler.py`：主程序，负责解析小说信息、目录、章节正文、图片，并生成 EPUB、TXT、MD、JSON 辅助文件。
+- `linovelib_gui.py`：本地可视化 App，可以加载小说目录、选择卷章、启动/停止爬取、查看实时日志。
+- `run_gui.bat`：Windows 双击启动可视化界面的脚本。
 - `downloads/`：运行后保存小说内容、图片、EPUB 和检查文件的目录。
 - `.idea/`：本地 IDE 配置目录。
 
@@ -31,6 +33,44 @@ pip install requests beautifulsoup4 ebooklib tqdm
 ```powershell
 python .\linovelib_crawler.py
 ```
+
+启动可视化界面：
+
+```powershell
+python .\linovelib_gui.py
+```
+
+也可以在资源管理器里双击：
+
+```text
+run_gui.bat
+```
+
+生成 Windows 安装包：
+
+```powershell
+winget install --id JRSoftware.InnoSetup --exact
+.\build_installer.bat
+```
+
+生成完成后，安装程序会保存到：
+
+```text
+release/LightNovelEPUBWorkbench_Setup_v1.0.0.exe
+```
+
+用户拿到这个安装程序后，按提示安装即可直接打开 `轻小说 EPUB 工作台` 使用，不需要另外安装 Python 或项目依赖。
+
+可视化界面完整流程：
+
+1. 填写小说 ID 或小说名称。
+2. 设置 `请求间隔秒`。默认 1.5 秒，遇到 `403` 或 `429` 时调高。
+3. 选择本地电脑上的 `下载目录`。
+4. 如需插图，勾选 `下载并嵌入图片`。不勾选会更快。
+5. 点击 `加载小说目录`。
+6. 在中间的卷章列表里单击卷或章节进行勾选。
+7. 点击 `开始爬取所选章节`。
+8. 在右侧查看实时日志，完成后点击 `打开下载目录` 查看 EPUB 和辅助文件。
 
 指定小说 ID 或链接：
 
@@ -70,13 +110,29 @@ python .\linovelib_crawler.py 2906 --volume 3 --chapter 5
 - `--volume N`：只爬取第 N 卷。
 - `--chapter N`：只爬取指定卷中的第 N 章，需要和 `--volume` 一起使用。
 
+可视化界面里有对应操作：
+
+- `小说ID / 名称`
+- `请求间隔秒`
+- `搜索页数`
+- `下载目录`
+- `☐/☑ 下载并嵌入图片`
+- `加载小说目录`
+- `卷章选择`
+- `开始爬取所选章节`
+
+只抓单章时，加载目录后在中间列表里单击对应章节即可。
+
 ## 输出位置
 
-默认输出到：
+命令行默认输出到项目目录下：
 
 ```text
 downloads/小说名/
 ```
+
+可视化界面可以自行选择本地电脑上的下载目录。
+界面会自适应窗口大小；窗口高度较小时，左侧设置区可以滚动。
 
 常见输出包括：
 

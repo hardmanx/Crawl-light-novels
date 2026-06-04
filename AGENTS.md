@@ -9,6 +9,8 @@
 ## 当前代码入口
 
 - 主文件：`linovelib_crawler.py`
+- 可视化界面：`linovelib_gui.py`
+- Windows 启动脚本：`run_gui.bat`
 - 主类：`LinovelibVolumeEpubCrawler`
 - 命令入口：`main()`
 - 默认输出目录：`downloads/`
@@ -47,8 +49,14 @@
 最轻量检查：
 
 ```powershell
-python -m py_compile .\linovelib_crawler.py
+python -m py_compile .\linovelib_crawler.py .\linovelib_gui.py
 ```
+
+可视化界面现在是完整 App 流程：加载目录、展示卷章树、勾选章节、爬取所选章节、生成 EPUB 和辅助文件。修改界面时不要退回到只拼命令的模式。
+
+界面支持用户自行选择下载目录；爬取所选章节时应使用界面选择的目录，而不是固定写入项目 `downloads/`。界面默认请求间隔比命令行低，且默认不下载图片以提升速度；不要改成绕过访问限制或激进并发。
+
+界面主输入框面向用户显示为“小说ID / 名称”。底层仍可兼容详情页/章节页链接，但界面文案不要再突出链接。图片下载开关使用自绘 `☐/☑` 按钮，避免 Windows 主题把勾选显示成叉号。
 
 如果改动了解析逻辑，优先加本地 HTML fixture 测试或用很小抓取范围验证：
 
