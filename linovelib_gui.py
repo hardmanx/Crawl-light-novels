@@ -7,9 +7,9 @@
 """
 
 import contextlib
-import json
 import os
 import queue
+import shutil
 import threading
 from pathlib import Path
 import tkinter as tk
@@ -18,11 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 import linovelib_crawler as crawler_module
 from linovelib_crawler import (
     LinovelibVolumeEpubCrawler,
-    SAVE_MD,
-    SAVE_TXT,
     SAVE_DIR,
-    blocks_to_markdown,
-    blocks_to_plain_text,
     safe_name,
 )
 
@@ -201,6 +197,7 @@ class CrawlerGui(tk.Tk):
         self.scan_pages_var = tk.StringVar(value="5")
         self.output_dir_var = tk.StringVar(value=str(DOWNLOADS_DIR))
         self.download_images_var = tk.BooleanVar(value=False)
+        self.include_spoiler_images_var = tk.BooleanVar(value=False)
         self._entry(parent, "小说ID / 名称", self.keyword_var)
 
         grid = ttk.Frame(parent, style="Panel.TFrame")
@@ -221,9 +218,16 @@ class CrawlerGui(tk.Tk):
             command=self.toggle_download_images,
         )
         self.download_images_button.pack(fill="x", pady=(0, 8))
+        self.include_spoiler_images_button = ttk.Button(
+            parent,
+            text="☐ 包含剧透完整插图",
+            style="Secondary.TButton",
+            command=self.toggle_include_spoiler_images,
+        )
+        self.include_spoiler_images_button.pack(fill="x", pady=(0, 8))
         ttk.Label(
             parent,
-            text="速度建议：普通文本章节用 1-2 秒；遇到 403/429 时调高间隔。图片下载会明显变慢。",
+            text="速度建议：普通文本章节用 1-2 秒；遇到 403/429 时调高间隔。剧透完整插图只在勾选图片下载时嵌入 EPUB。",
             wraplength=300,
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(0, 6))
@@ -325,6 +329,14 @@ class CrawlerGui(tk.Tk):
     def _refresh_download_images_button(self):
         mark = "☑" if self.download_images_var.get() else "☐"
         self.download_images_button.configure(text=f"{mark} 下载并嵌入图片（更慢）")
+
+    def toggle_include_spoiler_images(self):
+        self.include_spoiler_images_var.set(not self.include_spoiler_images_var.get())
+        self._refresh_include_spoiler_images_button()
+
+    def _refresh_include_spoiler_images_button(self):
+        mark = "☑" if self.include_spoiler_images_var.get() else "☐"
+        self.include_spoiler_images_button.configure(text=f"{mark} 包含剧透完整插图")
 
     def _entry(self, parent, label, variable):
         ttk.Label(parent, text=label).pack(anchor="w")
@@ -548,8 +560,10 @@ class CrawlerGui(tk.Tk):
     def _crawl_selected_worker(self, crawler, selected):
         writer = QueueWriter(self.log_queue)
         old_download_images = crawler_module.DOWNLOAD_IMAGES
+        old_include_spoiler_images = crawler_module.INCLUDE_SPOILER_IMAGES
         try:
             crawler_module.DOWNLOAD_IMAGES = self.download_images_var.get()
+            crawler_module.INCLUDE_SPOILER_IMAGES = self.include_spoiler_images_var.get()
             with contextlib.redirect_stdout(writer):
                 generated_epubs = self._crawl_selected(crawler, selected)
             writer.flush()
@@ -559,6 +573,7 @@ class CrawlerGui(tk.Tk):
             self.log_queue.put(("error", f"爬取失败：{exc}"))
         finally:
             crawler_module.DOWNLOAD_IMAGES = old_download_images
+            crawler_module.INCLUDE_SPOILER_IMAGES = old_include_spoiler_images
 
     def _crawl_selected(self, crawler, selected):
         output_dir = self._output_dir()
@@ -567,14 +582,11 @@ class CrawlerGui(tk.Tk):
         book_title = safe_name(self.book_info["title"])
         book_dir = output_dir / book_title
         epubs_dir = book_dir / "epubs"
-        image_dir = book_dir / "epub_images"
+        image_dir = book_dir / "_epub_images_tmp"
 
         book_dir.mkdir(parents=True, exist_ok=True)
         epubs_dir.mkdir(parents=True, exist_ok=True)
         image_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(book_dir / "book_info.json", "w", encoding="utf-8") as f:
-            json.dump(self.book_info, f, ensure_ascii=False, indent=2)
 
         selected_by_volume = {}
         for volume_index, chapter_index in selected:
@@ -588,12 +600,6 @@ class CrawlerGui(tk.Tk):
                 break
 
             volume_info = self.volumes[volume_index - 1]
-            volume_title = safe_name(volume_info["title"])
-            volume_dir = book_dir / f"{volume_index:02d}_{volume_title}"
-            volume_dir.mkdir(parents=True, exist_ok=True)
-
-            with open(volume_dir / "volume_info.json", "w", encoding="utf-8") as f:
-                json.dump(volume_info, f, ensure_ascii=False, indent=2)
 
             print("\n" + "=" * 80)
             print(f"开始处理第 {volume_index} 卷：{volume_info['title']}")
@@ -601,60 +607,29 @@ class CrawlerGui(tk.Tk):
             print("=" * 80)
 
             chapter_results = []
-            txt_file = None
-            volume_txt_path = volume_dir / f"{volume_title}.txt"
 
-            if SAVE_TXT:
-                txt_file = open(volume_txt_path, "w", encoding="utf-8")
-                txt_file.write(self.book_info["title"] + "\n")
-                txt_file.write(f"作者：{self.book_info.get('author')}\n")
-                txt_file.write(f"分卷：{volume_info['title']}\n")
-                txt_file.write(f"来源：{self.book_info['url']}\n\n")
+            for chapter_index in selected_by_volume[volume_index]:
+                if self.stop_requested:
+                    print("已请求停止，当前卷剩余章节不再处理。")
+                    break
 
-            try:
-                for chapter_index in selected_by_volume[volume_index]:
-                    if self.stop_requested:
-                        print("已请求停止，当前卷剩余章节不再处理。")
-                        break
+                chapter = volume_info["chapters"][chapter_index - 1]
 
-                    chapter = volume_info["chapters"][chapter_index - 1]
-                    chapter_title = safe_name(chapter["title"])
-                    chapter_dir = volume_dir / f"{chapter_index:03d}_{chapter_title}"
-                    chapter_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    chapter_data = crawler.parse_chapter(
+                        chapter=chapter,
+                        chapter_dir=book_dir,
+                        image_dir=image_dir,
+                        volume_order=volume_index,
+                        chapter_order=chapter_index,
+                    )
+                except Exception as exc:
+                    print(f"\n章节解析失败：{chapter['title']}")
+                    print(f"URL：{chapter['url']}")
+                    print(f"原因：{exc}")
+                    continue
 
-                    try:
-                        chapter_data = crawler.parse_chapter(
-                            chapter=chapter,
-                            chapter_dir=chapter_dir,
-                            image_dir=image_dir,
-                            volume_order=volume_index,
-                            chapter_order=chapter_index,
-                        )
-                    except Exception as exc:
-                        print(f"\n章节解析失败：{chapter['title']}")
-                        print(f"URL：{chapter['url']}")
-                        print(f"原因：{exc}")
-                        continue
-
-                    chapter_results.append(chapter_data)
-
-                    if SAVE_MD:
-                        md_path = chapter_dir / f"{chapter_title}.md"
-                        with open(md_path, "w", encoding="utf-8") as f:
-                            f.write(f"# {chapter_data['title']}\n\n")
-                            f.write(f"来源：{chapter_data['url']}\n\n")
-                            f.write(blocks_to_markdown(chapter_data.get("blocks", [])))
-
-                    with open(chapter_dir / "chapter_info.json", "w", encoding="utf-8") as f:
-                        json.dump(chapter_data, f, ensure_ascii=False, indent=2)
-
-                    if txt_file:
-                        txt_file.write(f"\n\n## {chapter_data['title']}\n\n")
-                        txt_file.write(blocks_to_plain_text(chapter_data.get("blocks", [])))
-                        txt_file.write("\n\n")
-            finally:
-                if txt_file:
-                    txt_file.close()
+                chapter_results.append(chapter_data)
 
             if not chapter_results:
                 print(f"第 {volume_index} 卷没有成功解析任何所选章节，跳过 EPUB。")
@@ -676,13 +651,14 @@ class CrawlerGui(tk.Tk):
             generated_epubs.append(str(epub_path))
             print(f"第 {volume_index} 卷 EPUB 已生成：{epub_path}")
 
-        with open(book_dir / "generated_epubs.json", "w", encoding="utf-8") as f:
-            json.dump(generated_epubs, f, ensure_ascii=False, indent=2)
+        if image_dir.exists():
+            shutil.rmtree(image_dir, ignore_errors=True)
 
         print("\n========== 任务完成 ==========")
         print(f"小说保存目录：{book_dir}")
         print(f"EPUB 输出目录：{epubs_dir}")
         print(f"是否下载图片：{crawler_module.DOWNLOAD_IMAGES}")
+        print(f"是否包含剧透完整插图：{crawler_module.INCLUDE_SPOILER_IMAGES}")
         return generated_epubs
 
     def request_stop(self):

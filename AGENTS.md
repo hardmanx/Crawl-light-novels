@@ -4,7 +4,7 @@
 
 ## 项目目标
 
-这个项目是一个本地 Python 小说抓取与 EPUB 生成工具。核心目标是：在不绕过任何访问限制的前提下，从 linovelib.com 的公开页面提取小说目录、章节文字和图片，并按卷生成可检查的 EPUB 及辅助文件。
+这个项目是一个本地 Python 小说抓取与 EPUB 生成工具。核心目标是：在不绕过任何访问限制的前提下，从 linovelib.com 的公开页面提取小说目录、章节文字和图片，并按卷生成 EPUB。用户端默认只输出 EPUB；TXT、MD、JSON 属于调试输出，默认关闭。
 
 ## 当前代码入口
 
@@ -42,7 +42,7 @@
 3. 产物写入模块
    - 输入：book_info、volume_result、输出目录。
    - 输出：生成的 EPUB 和辅助文件路径。
-   - 内部吸收：EPUB CSS、目录、spine、图片 item、TXT/MD/JSON 写入规则。
+   - 内部吸收：EPUB CSS、目录、spine、图片 item、可选调试文件写入规则。
 
 ## 验证方式
 
@@ -52,11 +52,13 @@
 python -m py_compile .\linovelib_crawler.py .\linovelib_gui.py
 ```
 
-可视化界面现在是完整 App 流程：加载目录、展示卷章树、勾选章节、爬取所选章节、生成 EPUB 和辅助文件。修改界面时不要退回到只拼命令的模式。
+可视化界面现在是完整 App 流程：加载目录、展示卷章树、勾选章节、爬取所选章节、生成 EPUB。修改界面时不要退回到只拼命令的模式。
 
 界面支持用户自行选择下载目录；爬取所选章节时应使用界面选择的目录，而不是固定写入项目 `downloads/`。界面默认请求间隔比命令行低，且默认不下载图片以提升速度；不要改成绕过访问限制或激进并发。
 
-界面主输入框面向用户显示为“小说ID / 名称”。底层仍可兼容详情页/章节页链接，但界面文案不要再突出链接。图片下载开关使用自绘 `☐/☑` 按钮，避免 Windows 主题把勾选显示成叉号。
+界面主输入框面向用户显示为“小说ID / 名称”。底层仍可兼容详情页/章节页链接，但界面文案不要再突出链接。图片下载开关和“包含剧透完整插图”开关使用自绘 `☐/☑` 按钮，避免 Windows 主题把勾选显示成叉号。
+
+linovelib 的插图页可能把部分完整插图放在 `#hidden-images` 中，并用“注意有剧透”提示。默认不要包含这部分内容；只有用户显式勾选“包含剧透完整插图”或命令行传入 `--include-spoiler-images` 时才加入 EPUB。
 
 如果改动了解析逻辑，优先加本地 HTML fixture 测试或用很小抓取范围验证：
 
@@ -70,7 +72,9 @@ python .\linovelib_crawler.py 2906 --max-volumes 1 --max-chapters 1
 python .\linovelib_crawler.py 2906 --volume 1 --chapter 1
 ```
 
-如果改动了 EPUB 生成，检查 `downloads/小说名/epubs/` 是否生成 EPUB，并确认 `generated_epubs.json` 已更新。
+如果改动了 EPUB 生成，检查 `downloads/小说名/epubs/` 是否生成 EPUB。默认不应额外生成 TXT、MD、JSON 或持久图片目录。
+
+部分 linovelib 章节会由页面脚本在浏览器端恢复正文顺序，并用 `data-k...` + `transform: scale(0)` 隐藏诱饵段落。修改章节正文提取时，要保留“优先读取浏览器渲染后的可见 DOM，浏览器不可用才回退原始 HTML”的逻辑，否则 EPUB 正文可能再次乱序。
 
 ## 已知注意点
 

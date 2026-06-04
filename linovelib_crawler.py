@@ -8,7 +8,7 @@ linovelib_crawler.py
 3. 支持 catalog 目录页
 4. 按网页原文顺序解析：文字、图片按出现顺序写入 EPUB
 5. 每一卷单独生成一个 EPUB
-6. 同时保存 TXT / MD / JSON，方便检查
+6. 默认只输出 EPUB；调试时可打开 TXT / MD / JSON 输出
 
 保存路径：
 downloads\小说名\epubs\01_卷名.epub
@@ -19,15 +19,24 @@ downloads\小说名\epubs\01_卷名.epub
 """
 
 import argparse
+import base64
+import hashlib
 import html
 import json
 import mimetypes
+import os
 import random
 import re
+import shutil
+import socket
+import struct
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -72,11 +81,23 @@ DEFAULT_SCAN_PAGES = 5
 # 是否下载并嵌入图片到 EPUB
 DOWNLOAD_IMAGES = True
 
-# 是否保存 TXT
-SAVE_TXT = True
+# 是否包含网页隐藏的完整插图。该区域通常提示“注意有剧透”，默认不包含。
+INCLUDE_SPOILER_IMAGES = False
 
-# 是否保存每章 MD
-SAVE_MD = True
+# 是否保存 TXT。面向普通用户默认只输出 EPUB。
+SAVE_TXT = False
+
+# 是否保存每章 MD。面向普通用户默认只输出 EPUB。
+SAVE_MD = False
+
+# 是否保存调试用 JSON 文件。面向普通用户默认关闭。
+SAVE_JSON = False
+
+# linovelib 的部分章节会先返回乱序正文，再由页面脚本在浏览器里恢复可见顺序。
+# 开启后，章节正文会优先读取浏览器渲染后的公开页面 DOM，避免 EPUB 正文顺序错乱。
+USE_RENDERED_CHAPTER_DOM = True
+RENDERED_DOM_VIRTUAL_TIME_BUDGET_MS = 5000
+RENDERED_DOM_TIMEOUT = 45
 
 # EPUB 作者，不填则尝试从网页解析
 DEFAULT_AUTHOR = "未知作者"
@@ -260,6 +281,8 @@ class LinovelibVolumeEpubCrawler:
         self.session = make_session()
         self.delay = delay
         self.scan_pages = scan_pages
+        self._rendered_browser_path = None
+        self._rendered_browser_checked = False
 
         # 图片缓存：同一张图只下载一次，但可以在 EPUB 中出现多次
         self.image_cache = {}
@@ -298,6 +321,415 @@ class LinovelibVolumeEpubCrawler:
     def get_soup(self, url: str) -> BeautifulSoup:
         html_text = self.get_html(url)
         return BeautifulSoup(html_text, "html.parser")
+
+    def find_system_browser(self):
+        """查找本机可用于导出渲染后 DOM 的 Edge / Chrome。"""
+        if self._rendered_browser_checked:
+            return self._rendered_browser_path
+
+        candidates = [
+            os.environ.get("LINOVELIB_BROWSER_PATH", ""),
+            shutil.which("msedge"),
+            shutil.which("msedge.exe"),
+            shutil.which("chrome"),
+            shutil.which("chrome.exe"),
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                self._rendered_browser_path = str(candidate)
+                break
+
+        self._rendered_browser_checked = True
+        return self._rendered_browser_path
+
+    def should_use_rendered_chapter_dom(self, soup: BeautifulSoup) -> bool:
+        """判断章节页是否需要等待浏览器脚本恢复正文顺序。"""
+        if not USE_RENDERED_CHAPTER_DOM:
+            return False
+
+        if not soup.select_one("#TextContent"):
+            return False
+
+        for script in soup.find_all("script"):
+            src = script.get("src", "")
+            text = script.get_text("", strip=False)
+
+            if "chapterlog.js" in src or "chapterlog.js" in text:
+                return True
+
+        return False
+
+    def websocket_send_frame(self, sock: socket.socket, text: str, opcode: int = 0x1):
+        payload = text.encode("utf-8")
+        header = bytearray([0x80 | opcode])
+
+        if len(payload) < 126:
+            header.append(0x80 | len(payload))
+        elif len(payload) < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", len(payload)))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", len(payload)))
+
+        mask = os.urandom(4)
+        masked_payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        sock.sendall(bytes(header) + mask + masked_payload)
+
+    def websocket_read_exact(self, sock: socket.socket, size: int) -> bytes:
+        chunks = []
+        remaining = size
+
+        while remaining > 0:
+            chunk = sock.recv(remaining)
+
+            if not chunk:
+                raise RuntimeError("浏览器调试连接已关闭。")
+
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+        return b"".join(chunks)
+
+    def websocket_recv_text(self, sock: socket.socket):
+        while True:
+            first_two = self.websocket_read_exact(sock, 2)
+            first, second = first_two[0], first_two[1]
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+
+            if length == 126:
+                length = struct.unpack("!H", self.websocket_read_exact(sock, 2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self.websocket_read_exact(sock, 8))[0]
+
+            mask = self.websocket_read_exact(sock, 4) if masked else b""
+            payload = self.websocket_read_exact(sock, length) if length else b""
+
+            if masked:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+
+            if opcode == 0x1:
+                return payload.decode("utf-8", errors="replace")
+
+            if opcode == 0x8:
+                return None
+
+            if opcode == 0x9:
+                self.websocket_send_frame(sock, payload.decode("utf-8", errors="replace"), opcode=0xA)
+
+    def websocket_connect(self, ws_url: str, timeout: int = 10) -> socket.socket:
+        parsed = urlparse(ws_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        path = parsed.path or "/"
+
+        if parsed.query:
+            path += "?" + parsed.query
+
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        if b" 101 " not in response.split(b"\r\n", 1)[0]:
+            sock.close()
+            raise RuntimeError("浏览器调试 WebSocket 握手失败。")
+
+        accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+
+        if f"Sec-WebSocket-Accept: {accept}".lower() not in response.decode(
+            "latin1",
+            errors="ignore",
+        ).lower():
+            sock.close()
+            raise RuntimeError("浏览器调试 WebSocket 校验失败。")
+
+        return sock
+
+    def cdp_call(self, sock: socket.socket, message_id: int, method: str, params=None):
+        payload = {
+            "id": message_id,
+            "method": method,
+            "params": params or {},
+        }
+        self.websocket_send_frame(sock, json.dumps(payload, ensure_ascii=False))
+
+        while True:
+            message = self.websocket_recv_text(sock)
+            if message is None:
+                raise RuntimeError("浏览器调试连接已关闭。")
+
+            data = json.loads(message)
+
+            if data.get("id") != message_id:
+                continue
+
+            if "error" in data:
+                raise RuntimeError(data["error"].get("message", "浏览器调试调用失败。"))
+
+            return data.get("result", {})
+
+    def get_rendered_soup(self, url: str):
+        """
+        使用本机浏览器导出脚本执行后的 DOM。
+        这不绕过访问限制，只是让公开页面完成自身的正文排序脚本。
+        """
+        browser_path = self.find_system_browser()
+        if not browser_path:
+            print("未找到 Edge / Chrome，已退回原始 HTML 正文解析。")
+            return None
+
+        temp_profile = tempfile.mkdtemp(prefix="linovelib-render-")
+        process = None
+        sock = None
+
+        try:
+            command = [
+                browser_path,
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--no-first-run",
+                "--no-default-browser-check",
+                f"--user-data-dir={temp_profile}",
+                "--remote-debugging-port=0",
+                f"--user-agent={HEADERS['User-Agent']}",
+                "about:blank",
+            ]
+
+            print("正在读取浏览器渲染后的章节正文顺序...")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+
+            active_port_file = Path(temp_profile) / "DevToolsActivePort"
+            deadline = time.time() + 10
+            port = None
+
+            while time.time() < deadline:
+                if process.poll() is not None:
+                    print("浏览器启动失败，已退回原始 HTML。")
+                    return None
+
+                if active_port_file.exists():
+                    lines = active_port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    if lines:
+                        port = int(lines[0])
+                        break
+
+                time.sleep(0.1)
+
+            if not port:
+                print("浏览器调试端口启动超时，已退回原始 HTML。")
+                return None
+
+            target_request = Request(
+                f"http://127.0.0.1:{port}/json/new?about:blank",
+                method="PUT",
+            )
+            with urlopen(target_request, timeout=5) as response:
+                target_info = json.loads(response.read().decode("utf-8"))
+
+            ws_url = target_info.get("webSocketDebuggerUrl")
+            if not ws_url:
+                print("浏览器页面调试地址获取失败，已退回原始 HTML。")
+                return None
+
+            sock = self.websocket_connect(ws_url, timeout=10)
+            message_id = 1
+
+            self.cdp_call(sock, message_id, "Page.enable")
+            message_id += 1
+            self.cdp_call(sock, message_id, "Runtime.enable")
+            message_id += 1
+            self.cdp_call(sock, message_id, "Page.navigate", {"url": url})
+            message_id += 1
+
+            ready_expression = """
+(() => {
+  const container = document.querySelector('#TextContent');
+  if (!container) return false;
+  const hasTaggedParagraph = container.querySelector('p[data-k]');
+  let hasHiddenRule = false;
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      for (const rule of Array.from(sheet.cssRules || [])) {
+        const text = rule.cssText || '';
+        if (text.includes('data-k') && (text.includes('scale(0)') || text.includes('position: absolute'))) {
+          hasHiddenRule = true;
+          break;
+        }
+      }
+    } catch (error) {}
+    if (hasHiddenRule) break;
+  }
+  return document.readyState === 'complete' && Boolean(hasTaggedParagraph || hasHiddenRule);
+})()
+"""
+            deadline = time.time() + max(8, RENDERED_DOM_VIRTUAL_TIME_BUDGET_MS / 1000)
+
+            while time.time() < deadline:
+                result = self.cdp_call(
+                    sock,
+                    message_id,
+                    "Runtime.evaluate",
+                    {
+                        "expression": ready_expression,
+                        "returnByValue": True,
+                    },
+                )
+                message_id += 1
+
+                if result.get("result", {}).get("value"):
+                    break
+
+                time.sleep(0.25)
+
+            extract_expression = f"""
+(() => {{
+  const includeSpoilerImages = {str(INCLUDE_SPOILER_IMAGES).lower()};
+  const container = document.querySelector('#TextContent');
+  if (!container) return '';
+
+  if (includeSpoilerImages) {{
+    const hiddenImages = document.getElementById('hidden-images');
+    if (hiddenImages) hiddenImages.style.display = 'block';
+  }}
+
+  const hiddenAttrs = new Set();
+  for (const sheet of Array.from(document.styleSheets)) {{
+    try {{
+      for (const rule of Array.from(sheet.cssRules || [])) {{
+        const text = rule.cssText || '';
+        const match = text.match(/p\\[(data-k\\d+)\\]/i);
+        if (match && (/scale\\(0\\)/i.test(text) || /position\\s*:\\s*absolute/i.test(text))) {{
+          hiddenAttrs.add(match[1].toLowerCase());
+        }}
+      }}
+    }} catch (error) {{}}
+  }}
+
+  function isHiddenElement(element) {{
+    if (!element || element.nodeType !== 1) return false;
+    const style = getComputedStyle(element);
+    const transform = style.transform || '';
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return true;
+    if (/matrix\\(0(?:,|\\s)/.test(transform) || /scale\\(0\\)/.test(transform)) return true;
+    for (const attr of Array.from(element.getAttributeNames())) {{
+      if (hiddenAttrs.has(attr.toLowerCase())) return true;
+    }}
+    return false;
+  }}
+
+  const clone = container.cloneNode(false);
+  for (const child of Array.from(container.childNodes)) {{
+    if (child.nodeType === 1 && isHiddenElement(child)) continue;
+    clone.appendChild(child.cloneNode(true));
+  }}
+
+  return clone.outerHTML;
+}})()
+"""
+            result = self.cdp_call(
+                sock,
+                message_id,
+                "Runtime.evaluate",
+                {
+                    "expression": extract_expression,
+                    "returnByValue": True,
+                },
+            )
+            html_text = result.get("result", {}).get("value", "")
+
+            if not html_text:
+                print("渲染后 DOM 未找到正文容器，已退回原始 HTML。")
+                return None
+
+            rendered_soup = BeautifulSoup(html_text, "html.parser")
+            return rendered_soup
+        except Exception as exc:
+            print(f"渲染后 DOM 读取异常，已退回原始 HTML：{exc}")
+            return None
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+            shutil.rmtree(temp_profile, ignore_errors=True)
+
+    def remove_rendered_hidden_paragraphs(self, soup: BeautifulSoup):
+        """
+        移除网站脚本注入的不可见诱饵段落。
+        这些段落通常会被 CSS 标记为 position:absolute + transform:scale(0)。
+        """
+        hidden_attrs = set()
+
+        for style in soup.find_all("style"):
+            css_text = style.get_text("\n", strip=False)
+
+            for match in re.finditer(
+                r"p\[(data-k\d+)\]\s*\{[^}]*?(?:transform\s*:\s*scale\(0\)|position\s*:\s*absolute)",
+                css_text,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                hidden_attrs.add(match.group(1).lower())
+
+        if not hidden_attrs:
+            return
+
+        container = soup.select_one("#TextContent")
+        if not container:
+            return
+
+        removed = 0
+        for paragraph in list(container.find_all("p")):
+            attr_names = {name.lower() for name in paragraph.attrs}
+
+            if attr_names.intersection(hidden_attrs):
+                paragraph.decompose()
+                removed += 1
+
+        if removed:
+            print(f"已过滤网页隐藏诱饵段落：{removed} 段")
 
     # =====================================================
     # 第一步：根据小说名 / 小说 ID / 链接找到详情页
@@ -887,6 +1319,12 @@ class LinovelibVolumeEpubCrawler:
         id_text = str(tag.get("id", "")).lower()
         role_text = str(tag.get("role", "")).lower()
 
+        if id_text == "show-more-images":
+            return True
+
+        if id_text == "hidden-images" and not INCLUDE_SPOILER_IMAGES:
+            return True
+
         bad_words = [
             "nav",
             "menu",
@@ -988,6 +1426,72 @@ class LinovelibVolumeEpubCrawler:
                 }
             )
 
+    def append_image_block(self, blocks: list, img: Tag):
+        """按当前位置追加图片 block。"""
+        img_url = self.get_image_src(img)
+
+        if not img_url:
+            return
+
+        blocks.append(
+            {
+                "type": "image",
+                "url": img_url,
+                "alt": clean_spaces(img.get("alt", "")),
+            }
+        )
+
+    def split_text_and_inline_images(self, node: Tag, page_url: str) -> list:
+        """
+        在一个段落/块级节点内部按子节点顺序拆分文字和图片。
+        这样图片前后的文字不会被合并到错误位置。
+        """
+        child_blocks = []
+
+        def walk_inline(child):
+            if isinstance(child, NavigableString):
+                self.merge_text_block(child_blocks, str(child))
+                return
+
+            if not isinstance(child, Tag):
+                return
+
+            if self.is_bad_tag(child):
+                return
+
+            if child.name == "img":
+                self.append_image_block(child_blocks, child)
+                return
+
+            if child.name == "br":
+                if child_blocks and child_blocks[-1]["type"] == "text":
+                    child_blocks[-1]["text"] = child_blocks[-1]["text"].rstrip() + "\n"
+                return
+
+            for grand_child in list(child.children):
+                walk_inline(grand_child)
+
+        for child in list(node.children):
+            walk_inline(child)
+
+        return child_blocks
+
+    def append_block_preserving_boundaries(self, blocks: list, block: dict):
+        """追加解析结果，避免跨图片或跨段落把文字粘到一起。"""
+        if block.get("type") == "text":
+            text = clean_spaces(block.get("text", ""))
+
+            if self.should_skip_text(text):
+                return
+
+            if blocks and blocks[-1]["type"] == "text":
+                blocks[-1]["text"] = blocks[-1]["text"].rstrip() + "\n" + text
+            else:
+                blocks.append({"type": "text", "text": text})
+
+        elif block.get("type") == "image":
+            blocks.append(block)
+
     def extract_ordered_blocks(self, container: Tag, page_url: str) -> list:
         """
         核心函数：
@@ -996,6 +1500,17 @@ class LinovelibVolumeEpubCrawler:
         遇到图片，生成 image block。
         """
         blocks = []
+        block_tags = {
+            "p",
+            "div",
+            "section",
+            "article",
+            "li",
+            "blockquote",
+            "h2",
+            "h3",
+            "h4",
+        }
 
         def walk(node):
             if isinstance(node, NavigableString):
@@ -1010,17 +1525,7 @@ class LinovelibVolumeEpubCrawler:
                 return
 
             if node.name == "img":
-                img_url = self.get_image_src(node)
-
-                if img_url:
-                    blocks.append(
-                        {
-                            "type": "image",
-                            "url": img_url,
-                            "alt": clean_spaces(node.get("alt", "")),
-                        }
-                    )
-
+                self.append_image_block(blocks, node)
                 return
 
             if node.name == "br":
@@ -1028,12 +1533,16 @@ class LinovelibVolumeEpubCrawler:
                     blocks[-1]["text"] = blocks[-1]["text"].rstrip() + "\n"
                 return
 
+            if node.name in block_tags and node is not container:
+                child_blocks = self.split_text_and_inline_images(node, page_url)
+
+                for child_block in child_blocks:
+                    self.append_block_preserving_boundaries(blocks, child_block)
+
+                return
+
             for child in list(node.children):
                 walk(child)
-
-            if node.name in ["p", "div", "section", "article", "li", "h2", "h3", "h4"]:
-                if blocks and blocks[-1]["type"] == "text":
-                    blocks[-1]["text"] = blocks[-1]["text"].strip()
 
         walk(container)
 
@@ -1172,6 +1681,14 @@ class LinovelibVolumeEpubCrawler:
         soup = self.get_soup(chapter_url)
 
         chapter_real_title = self.extract_chapter_title(soup, default_title)
+
+        if self.should_use_rendered_chapter_dom(soup):
+            rendered_soup = self.get_rendered_soup(chapter_url)
+
+            if rendered_soup:
+                soup = rendered_soup
+                print("已使用浏览器渲染后的可见正文顺序。")
+
         container = self.find_content_container(soup)
 
         blocks = self.extract_ordered_blocks(container, chapter_url)
@@ -1461,6 +1978,9 @@ class LinovelibVolumeEpubCrawler:
         epub_book.add_item(epub.EpubNcx())
         epub_book.add_item(epub.EpubNav())
 
+        if epub_path.exists():
+            epub_path.unlink()
+
         epub.write_epub(str(epub_path), epub_book)
 
         return epub_path
@@ -1492,7 +2012,7 @@ class LinovelibVolumeEpubCrawler:
         epubs_dir = book_dir / "epubs"
         epubs_dir.mkdir(parents=True, exist_ok=True)
 
-        image_dir = book_dir / "epub_images"
+        image_dir = book_dir / "_epub_images_tmp"
         image_dir.mkdir(parents=True, exist_ok=True)
 
         print("\n========== 小说信息 ==========")
@@ -1504,8 +2024,9 @@ class LinovelibVolumeEpubCrawler:
         print(f"EPUB 输出目录：{epubs_dir}")
         print("==============================\n")
 
-        with open(book_dir / "book_info.json", "w", encoding="utf-8") as f:
-            json.dump(book_info, f, ensure_ascii=False, indent=2)
+        if SAVE_JSON:
+            with open(book_dir / "book_info.json", "w", encoding="utf-8") as f:
+                json.dump(book_info, f, ensure_ascii=False, indent=2)
 
         print("\n开始构建卷列表...")
         all_volumes = self.build_volume_list(book_info)
@@ -1548,10 +2069,13 @@ class LinovelibVolumeEpubCrawler:
 
             volume_title = safe_name(volume_info["title"])
             volume_dir = book_dir / f"{volume_index:02d}_{volume_title}"
-            volume_dir.mkdir(parents=True, exist_ok=True)
 
-            with open(volume_dir / "volume_info.json", "w", encoding="utf-8") as f:
-                json.dump(volume_info, f, ensure_ascii=False, indent=2)
+            if SAVE_TXT or SAVE_MD or SAVE_JSON:
+                volume_dir.mkdir(parents=True, exist_ok=True)
+
+            if SAVE_JSON:
+                with open(volume_dir / "volume_info.json", "w", encoding="utf-8") as f:
+                    json.dump(volume_info, f, ensure_ascii=False, indent=2)
 
             chapters = volume_info["chapters"]
             total_chapters = len(chapters)
@@ -1592,7 +2116,9 @@ class LinovelibVolumeEpubCrawler:
                 ):
                     chapter_title = safe_name(chapter["title"])
                     chapter_dir = volume_dir / f"{chapter_index:03d}_{chapter_title}"
-                    chapter_dir.mkdir(parents=True, exist_ok=True)
+
+                    if SAVE_MD or SAVE_JSON:
+                        chapter_dir.mkdir(parents=True, exist_ok=True)
 
                     try:
                         chapter_data = self.parse_chapter(
@@ -1618,8 +2144,9 @@ class LinovelibVolumeEpubCrawler:
                             f.write(f"来源：{chapter_data['url']}\n\n")
                             f.write(blocks_to_markdown(chapter_data.get("blocks", [])))
 
-                    with open(chapter_dir / "chapter_info.json", "w", encoding="utf-8") as f:
-                        json.dump(chapter_data, f, ensure_ascii=False, indent=2)
+                    if SAVE_JSON:
+                        with open(chapter_dir / "chapter_info.json", "w", encoding="utf-8") as f:
+                            json.dump(chapter_data, f, ensure_ascii=False, indent=2)
 
                     if txt_file:
                         txt_file.write(f"\n\n## {chapter_data['title']}\n\n")
@@ -1652,8 +2179,12 @@ class LinovelibVolumeEpubCrawler:
 
             print(f"第 {volume_index} 卷 EPUB 已生成：{epub_path}")
 
-        with open(book_dir / "generated_epubs.json", "w", encoding="utf-8") as f:
-            json.dump(generated_epubs, f, ensure_ascii=False, indent=2)
+        if SAVE_JSON:
+            with open(book_dir / "generated_epubs.json", "w", encoding="utf-8") as f:
+                json.dump(generated_epubs, f, ensure_ascii=False, indent=2)
+
+        if image_dir.exists():
+            shutil.rmtree(image_dir, ignore_errors=True)
 
         print("\n========== 全部完成 ==========")
         print(f"小说保存目录：{book_dir}")
@@ -1724,7 +2255,16 @@ def main():
         help="只爬取指定卷中的第 N 章，章节号从 1 开始。使用时必须同时指定 --volume",
     )
 
+    parser.add_argument(
+        "--include-spoiler-images",
+        action="store_true",
+        help="包含网页隐藏的完整插图。该区域通常提示有剧透，默认不包含。",
+    )
+
     args = parser.parse_args()
+
+    global INCLUDE_SPOILER_IMAGES
+    INCLUDE_SPOILER_IMAGES = args.include_spoiler_images
 
     if not args.keyword or str(args.keyword).strip() == "":
         raise RuntimeError(
@@ -1749,6 +2289,7 @@ def main():
     print(f"指定卷号：{args.volume}")
     print(f"指定章节号：{args.chapter}")
     print(f"是否下载并嵌入图片：{DOWNLOAD_IMAGES}")
+    print(f"是否包含剧透完整插图：{INCLUDE_SPOILER_IMAGES}")
     print("EPUB 生成方式：每一卷单独生成一个 EPUB")
     print("================================\n")
 

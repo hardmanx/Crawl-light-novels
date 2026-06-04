@@ -4,7 +4,7 @@
 
 ## 项目内容
 
-- `linovelib_crawler.py`：主程序，负责解析小说信息、目录、章节正文、图片，并生成 EPUB、TXT、MD、JSON 辅助文件。
+- `linovelib_crawler.py`：主程序，负责解析小说信息、目录、章节正文、图片，并生成 EPUB。
 - `linovelib_gui.py`：本地可视化 App，可以加载小说目录、选择卷章、启动/停止爬取、查看实时日志。
 - `run_gui.bat`：Windows 双击启动可视化界面的脚本。
 - `downloads/`：运行后保存小说内容、图片、EPUB 和检查文件的目录。
@@ -16,8 +16,9 @@
 - 支持传统分卷页 `vol_xxx.html`。
 - 支持 `catalog` 目录页，并尝试按目录标题拆分卷。
 - 按网页原文顺序提取文字和图片。
+- 部分章节会优先按本机 Edge / Chrome 渲染后的可见正文提取，过滤网页隐藏的诱饵段落，避免 EPUB 正文顺序错乱。
 - 每一卷单独生成一个 EPUB。
-- 同时保存 TXT、每章 MD、章节 JSON、书籍 JSON，便于检查。
+- 用户端默认只输出 EPUB 文件；调试用 TXT、MD、JSON 输出默认关闭。
 - 对请求设置延迟和重试，避免过快访问。
 
 ## 运行方式
@@ -67,10 +68,11 @@ release/LightNovelEPUBWorkbench_Setup_v1.0.0.exe
 2. 设置 `请求间隔秒`。默认 1.5 秒，遇到 `403` 或 `429` 时调高。
 3. 选择本地电脑上的 `下载目录`。
 4. 如需插图，勾选 `下载并嵌入图片`。不勾选会更快。
-5. 点击 `加载小说目录`。
-6. 在中间的卷章列表里单击卷或章节进行勾选。
-7. 点击 `开始爬取所选章节`。
-8. 在右侧查看实时日志，完成后点击 `打开下载目录` 查看 EPUB 和辅助文件。
+5. 如需网页提示“注意有剧透”的完整插图，再勾选 `包含剧透完整插图`。
+6. 点击 `加载小说目录`。
+7. 在中间的卷章列表里单击卷或章节进行勾选。
+8. 点击 `开始爬取所选章节`。
+9. 在右侧查看实时日志，完成后点击 `打开下载目录` 查看 EPUB。
 
 指定小说 ID 或链接：
 
@@ -102,13 +104,16 @@ python .\linovelib_crawler.py 2906 --volume 3 --chapter 5
 - `DEFAULT_MAX_CHAPTERS`：每卷默认最多抓取几章。
 - `DEFAULT_DELAY`：每次请求前的等待秒数。
 - `DOWNLOAD_IMAGES`：是否下载并嵌入图片。
-- `SAVE_TXT`：是否保存 TXT。
-- `SAVE_MD`：是否保存每章 MD。
+- `INCLUDE_SPOILER_IMAGES`：是否包含网页隐藏的完整插图，默认关闭。
+- `SAVE_TXT`：是否保存 TXT，默认关闭。
+- `SAVE_MD`：是否保存每章 MD，默认关闭。
+- `SAVE_JSON`：是否保存调试 JSON，默认关闭。
 
 命令行也支持：
 
 - `--volume N`：只爬取第 N 卷。
 - `--chapter N`：只爬取指定卷中的第 N 章，需要和 `--volume` 一起使用。
+- `--include-spoiler-images`：包含网页隐藏的完整插图。该区域通常提示有剧透，默认不包含。
 
 可视化界面里有对应操作：
 
@@ -117,6 +122,7 @@ python .\linovelib_crawler.py 2906 --volume 3 --chapter 5
 - `搜索页数`
 - `下载目录`
 - `☐/☑ 下载并嵌入图片`
+- `☐/☑ 包含剧透完整插图`
 - `加载小说目录`
 - `卷章选择`
 - `开始爬取所选章节`
@@ -137,10 +143,8 @@ downloads/小说名/
 常见输出包括：
 
 - `epubs/`：生成的 EPUB。
-- `epub_images/`：下载的图片。
-- `book_info.json`：书籍信息。
-- `generated_epubs.json`：已生成 EPUB 路径。
-- `01_卷名/`、`02_卷名/`：每卷的章节、TXT、MD、JSON。
+
+图片下载会使用临时目录参与 EPUB 打包，生成完成后会自动清理。TXT、Markdown、JSON 等调试文件默认不会输出。
 
 ## 使用注意
 
