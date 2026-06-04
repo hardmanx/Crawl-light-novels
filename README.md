@@ -1,4 +1,4 @@
-# 浩鑫小说 EPUB 爬取项目
+# 小说 EPUB 爬取项目
 
 这是一个用于从 linovelib.com 公开可访问页面抓取小说内容，并按卷生成 EPUB 的本地 Python 项目。当前核心程序是 `linovelib_crawler.py`。
 
