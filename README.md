@@ -57,7 +57,7 @@ winget install --id JRSoftware.InnoSetup --exact
 生成完成后，安装程序会保存到：
 
 ```text
-release/LightNovelEPUBWorkbench_Setup_v1.0.0.exe
+release/LightNovelEPUBWorkbench_Setup_v1.0.1.exe
 ```
 
 用户拿到这个安装程序后，按提示安装即可直接打开 `轻小说 EPUB 工作台` 使用，不需要另外安装 Python 或项目依赖。

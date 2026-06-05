@@ -45,6 +45,11 @@ from urllib3.util.retry import Retry
 from ebooklib import epub
 
 try:
+    import winreg
+except ImportError:
+    winreg = None
+
+try:
     from tqdm import tqdm
 except ImportError:
     def tqdm(iterable, desc=None):
@@ -327,6 +332,7 @@ class LinovelibVolumeEpubCrawler:
         if self._rendered_browser_checked:
             return self._rendered_browser_path
 
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
         candidates = [
             os.environ.get("LINOVELIB_BROWSER_PATH", ""),
             shutil.which("msedge"),
@@ -337,15 +343,50 @@ class LinovelibVolumeEpubCrawler:
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            str(Path(local_app_data) / "Microsoft" / "Edge" / "Application" / "msedge.exe") if local_app_data else "",
+            str(Path(local_app_data) / "Google" / "Chrome" / "Application" / "chrome.exe") if local_app_data else "",
         ]
+        candidates.extend(self.find_browser_paths_from_registry())
 
         for candidate in candidates:
-            if candidate and Path(candidate).exists():
-                self._rendered_browser_path = str(candidate)
+            if not candidate:
+                continue
+
+            path = Path(os.path.expandvars(candidate)).expanduser()
+            if path.exists():
+                self._rendered_browser_path = str(path)
                 break
 
         self._rendered_browser_checked = True
         return self._rendered_browser_path
+
+    def find_browser_paths_from_registry(self):
+        """从 Windows 注册表补充查找 Edge / Chrome 安装路径。"""
+        if winreg is None:
+            return []
+
+        paths = []
+        app_names = ["msedge.exe", "chrome.exe"]
+        roots = [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]
+        access_modes = [
+            winreg.KEY_READ,
+            winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
+            winreg.KEY_READ | getattr(winreg, "KEY_WOW64_32KEY", 0),
+        ]
+
+        for root in roots:
+            for app_name in app_names:
+                subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{app_name}"
+                for access in access_modes:
+                    try:
+                        with winreg.OpenKey(root, subkey, 0, access) as key:
+                            value, _ = winreg.QueryValueEx(key, "")
+                            if value:
+                                paths.append(value)
+                    except OSError:
+                        continue
+
+        return paths
 
     def should_use_rendered_chapter_dom(self, soup: BeautifulSoup) -> bool:
         """判断章节页是否需要等待浏览器脚本恢复正文顺序。"""
@@ -495,6 +536,100 @@ class LinovelibVolumeEpubCrawler:
 
             return data.get("result", {})
 
+    def get_free_debug_port(self) -> int:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+        finally:
+            probe.close()
+
+    def collect_browser_stderr(self, process: subprocess.Popen) -> str:
+        if not process or not process.stderr:
+            return ""
+
+        try:
+            _, stderr = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            return ""
+
+        if not stderr:
+            return ""
+
+        if isinstance(stderr, bytes):
+            return stderr.decode("utf-8", errors="replace").strip()
+
+        return str(stderr).strip()
+
+    def wait_for_browser_debug_port(self, process: subprocess.Popen, port: int, timeout: int = 12):
+        deadline = time.time() + timeout
+        last_error = ""
+
+        while time.time() < deadline:
+            if process.poll() is not None:
+                error_text = self.collect_browser_stderr(process)
+                if error_text:
+                    return False, error_text
+                return False, f"浏览器进程提前退出，退出码：{process.returncode}"
+
+            try:
+                with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1):
+                    return True, ""
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(0.2)
+
+        return False, f"浏览器调试端口启动超时：{last_error}"
+
+    def terminate_browser_process(self, process: subprocess.Popen):
+        if not process or process.poll() is not None:
+            return
+
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    def launch_render_browser(self, browser_path: str, temp_profile: str):
+        last_error = ""
+
+        for headless_arg in ["--headless=new", "--headless"]:
+            port = self.get_free_debug_port()
+            command = [
+                browser_path,
+                headless_arg,
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-software-rasterizer",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--remote-allow-origins=*",
+                f"--user-data-dir={temp_profile}",
+                f"--remote-debugging-port={port}",
+                f"--user-agent={HEADERS['User-Agent']}",
+                "about:blank",
+            ]
+
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+
+            ok, error_text = self.wait_for_browser_debug_port(process, port)
+            if ok:
+                return process, port, ""
+
+            last_error = error_text or f"{headless_arg} 启动失败"
+            self.terminate_browser_process(process)
+
+        return None, None, last_error
+
     def get_rendered_soup(self, url: str):
         """
         使用本机浏览器导出脚本执行后的 DOM。
@@ -510,47 +645,11 @@ class LinovelibVolumeEpubCrawler:
         sock = None
 
         try:
-            command = [
-                browser_path,
-                "--headless=new",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--no-first-run",
-                "--no-default-browser-check",
-                f"--user-data-dir={temp_profile}",
-                "--remote-debugging-port=0",
-                f"--user-agent={HEADERS['User-Agent']}",
-                "about:blank",
-            ]
-
             print("正在读取浏览器渲染后的章节正文顺序...")
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            process, port, launch_error = self.launch_render_browser(browser_path, temp_profile)
 
-            active_port_file = Path(temp_profile) / "DevToolsActivePort"
-            deadline = time.time() + 10
-            port = None
-
-            while time.time() < deadline:
-                if process.poll() is not None:
-                    print("浏览器启动失败，已退回原始 HTML。")
-                    return None
-
-                if active_port_file.exists():
-                    lines = active_port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                    if lines:
-                        port = int(lines[0])
-                        break
-
-                time.sleep(0.1)
-
-            if not port:
-                print("浏览器调试端口启动超时，已退回原始 HTML。")
+            if not process or not port:
+                print(f"浏览器启动失败，已退回原始 HTML。原因：{launch_error}")
                 return None
 
             target_request = Request(
@@ -1682,12 +1781,17 @@ class LinovelibVolumeEpubCrawler:
 
         chapter_real_title = self.extract_chapter_title(soup, default_title)
 
-        if self.should_use_rendered_chapter_dom(soup):
+        needs_rendered_dom = self.should_use_rendered_chapter_dom(soup)
+
+        if needs_rendered_dom:
             rendered_soup = self.get_rendered_soup(chapter_url)
 
             if rendered_soup:
                 soup = rendered_soup
                 print("已使用浏览器渲染后的可见正文顺序。")
+            else:
+                self.remove_rendered_hidden_paragraphs(soup)
+                print("警告：本章需要浏览器渲染才能完全还原网页正文顺序，当前已使用原始 HTML 兜底，文本可能仍与网页显示不一致。")
 
         container = self.find_content_container(soup)
 
