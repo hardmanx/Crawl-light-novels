@@ -263,16 +263,16 @@ class CrawlerGui(tk.Tk):
 
         columns = ("mark", "title", "count", "url")
         self.chapter_tree = ttk.Treeview(parent, columns=columns, show="tree headings", selectmode="browse")
-        self.chapter_tree.heading("#0", text="结构")
+        self.chapter_tree.heading("#0", text="网站卷章")
         self.chapter_tree.heading("mark", text="选择")
         self.chapter_tree.heading("title", text="标题")
         self.chapter_tree.heading("count", text="数量")
         self.chapter_tree.heading("url", text="URL")
-        self.chapter_tree.column("#0", width=72, stretch=False)
+        self.chapter_tree.column("#0", width=360, stretch=True)
         self.chapter_tree.column("mark", width=56, anchor="center", stretch=False)
-        self.chapter_tree.column("title", width=260)
+        self.chapter_tree.column("title", width=240)
         self.chapter_tree.column("count", width=70, anchor="center", stretch=False)
-        self.chapter_tree.column("url", width=310)
+        self.chapter_tree.column("url", width=220)
         self.chapter_tree.grid(row=1, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(parent, command=self.chapter_tree.yview)
@@ -436,25 +436,27 @@ class CrawlerGui(tk.Tk):
 
         for volume_index, volume in enumerate(self.volumes, 1):
             volume_id = f"v:{volume_index}"
+            volume_title = volume.get("title", "未命名卷")
             chapter_count = len(volume.get("chapters", []))
             item_id = self.chapter_tree.insert(
                 "",
                 "end",
                 iid=volume_id,
-                text=f"第 {volume_index} 卷",
-                values=(UNCHECKED, volume.get("title", "未命名卷"), f"{chapter_count} 章", volume.get("url", "")),
+                text=f"网站第 {volume_index} 项 | {volume_title}",
+                values=(UNCHECKED, volume_title, f"{chapter_count} 章", volume.get("url", "")),
                 open=True,
             )
             self.volume_items[volume_index] = item_id
 
             for chapter_index, chapter in enumerate(volume.get("chapters", []), 1):
                 chapter_id = f"c:{volume_index}:{chapter_index}"
+                chapter_title = chapter.get("title", f"章节 {chapter_index}")
                 self.chapter_tree.insert(
                     item_id,
                     "end",
                     iid=chapter_id,
-                    text=f"{chapter_index:03d}",
-                    values=(UNCHECKED, chapter.get("title", f"章节 {chapter_index}"), "", chapter.get("url", "")),
+                    text=f"{chapter_index:03d} | {chapter_title}",
+                    values=(UNCHECKED, chapter_title, "", chapter.get("url", "")),
                 )
                 self.chapter_items[(volume_index, chapter_index)] = chapter_id
 
@@ -602,7 +604,8 @@ class CrawlerGui(tk.Tk):
             volume_info = self.volumes[volume_index - 1]
 
             print("\n" + "=" * 80)
-            print(f"开始处理第 {volume_index} 卷：{volume_info['title']}")
+            print(f"开始处理网站第 {volume_index} 项：{volume_info['title']}")
+            print(f"分卷地址：{volume_info.get('url', '')}")
             print(f"本卷已选择章节数：{len(selected_by_volume[volume_index])}")
             print("=" * 80)
 
@@ -632,7 +635,7 @@ class CrawlerGui(tk.Tk):
                 chapter_results.append(chapter_data)
 
             if not chapter_results:
-                print(f"第 {volume_index} 卷没有成功解析任何所选章节，跳过 EPUB。")
+                print(f"网站第 {volume_index} 项没有成功解析任何所选章节，跳过 EPUB。")
                 continue
 
             volume_result = {
@@ -641,7 +644,7 @@ class CrawlerGui(tk.Tk):
                 "chapters": chapter_results,
             }
 
-            print(f"\n开始生成第 {volume_index} 卷 EPUB...")
+            print(f"\n开始生成网站第 {volume_index} 项 EPUB：{volume_info['title']}")
             epub_path = crawler.create_epub_for_volume(
                 book_info=self.book_info,
                 volume_result=volume_result,
@@ -649,7 +652,7 @@ class CrawlerGui(tk.Tk):
                 epubs_dir=epubs_dir,
             )
             generated_epubs.append(str(epub_path))
-            print(f"第 {volume_index} 卷 EPUB 已生成：{epub_path}")
+            print(f"网站第 {volume_index} 项 EPUB 已生成：{epub_path}")
 
         if image_dir.exists():
             shutil.rmtree(image_dir, ignore_errors=True)

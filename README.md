@@ -57,7 +57,7 @@ winget install --id JRSoftware.InnoSetup --exact
 生成完成后，安装程序会保存到：
 
 ```text
-release/LightNovelEPUBWorkbench_Setup_v1.0.1.exe
+release/LightNovelEPUBWorkbench_Setup_v1.0.2.exe
 ```
 
 用户拿到这个安装程序后，按提示安装即可直接打开 `轻小说 EPUB 工作台` 使用，不需要另外安装 Python 或项目依赖。
@@ -70,7 +70,7 @@ release/LightNovelEPUBWorkbench_Setup_v1.0.1.exe
 4. 如需插图，勾选 `下载并嵌入图片`。不勾选会更快。
 5. 如需网页提示“注意有剧透”的完整插图，再勾选 `包含剧透完整插图`。
 6. 点击 `加载小说目录`。
-7. 在中间的卷章列表里单击卷或章节进行勾选。
+7. 在中间的卷章列表里单击卷或章节进行勾选。卷章顺序按网站页面实际顺序显示，卷名会完整显示，便于区分台版、不同地区版本等重复卷号。
 8. 点击 `开始爬取所选章节`。
 9. 在右侧查看实时日志，完成后点击 `打开下载目录` 查看 EPUB。
 

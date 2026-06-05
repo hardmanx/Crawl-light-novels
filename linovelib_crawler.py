@@ -1091,8 +1091,6 @@ class LinovelibVolumeEpubCrawler:
 
         # 如果详情页有传统分卷链接，就用分卷链接
         if volume_links:
-            volume_links.reverse()
-
             return {
                 "book_id": book_id,
                 "title": title,

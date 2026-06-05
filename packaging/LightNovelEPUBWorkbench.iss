@@ -1,5 +1,5 @@
 #define MyAppName "轻小说 EPUB 工作台"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "hardmanx"
 #define MyAppExeName "LightNovelEPUBWorkbench.exe"
 
